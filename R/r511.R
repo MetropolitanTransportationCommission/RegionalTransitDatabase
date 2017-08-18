@@ -1,3 +1,243 @@
+#'Analyze a GTFS priority object for a provider to determine which bus stops are eligible for Transit Priority Areas (http://www.fehrandpeers.com/sb743/).
+#'@param A gtfsr priority object as returned by get_priority_routes()
+#'@returns A dataframe for high frequency stops
+get_priority_stops <- function(gtfs_objp) {
+  #only calculate and save distance information if the routes dataframe exists for the provider
+  #drop stops not on hf routes
+  ###########################################################################################
+  # Section 6. Join the calculated am and pm peak routes (tpa eligible) back to stop tables
+  
+  df_rt_hf <- join_high_frequency_routes_to_stops(gtfs_objp$mtc_am_stops,
+                                                  gtfs_objp$mtc_pm_stops,
+                                                  gtfs_objp$mtc_am_routes,
+                                                  gtfs_objp$mtc_pm_routes)
+  
+  #df_rt_hf <- gtfs_objp$mtc_routes_df[gtfs_objp$mtc_routes_df$f_tpa_qual==TRUE,]
+  df_sr <- gtfs_objp$mtc_combined_gtfs
+  
+  # df_rt_hf_non_qualifying <- join_high_frequency_routes_to_stops(am_stops,pm_stops,am_routes_nonq,pm_routes_nonq)
+  # 
+  # ###########################################################################################
+  df_stp_rt_hf <- join_mega_and_hf_routes(df_sr,df_rt_hf)
+  
+  df_stp_rt_hf <- deduplicate_final_table(df_stp_rt_hf)
+  
+  #Remove select cols.
+  df_stp_rt_hf <- df_stp_rt_hf[-c(1:13)]
+  # 
+  
+  df_stp_rt_hf$cnt_adjacent_hf_routes <- rep(0,nrow(df_stp_rt_hf))
+  df_stp_rt_hf$lgcl_adjacent_hf_routes <- rep(FALSE,nrow(df_stp_rt_hf))
+  
+  #############################
+  ##Put stops into a 
+  ##SpatialPointsDataFrame
+  ###########################
+  
+  df_stp_rt_hf_xy <- as.data.frame(df_stp_rt_hf)
+  coordinates(df_stp_rt_hf_xy) = ~stop_lon + stop_lat
+  proj4string(df_stp_rt_hf_xy) <- CRS("+proj=longlat +datum=WGS84")
+  df_stp_rt_hf_xy <- spTransform(df_stp_rt_hf_xy, CRS("+init=epsg:26910"))
+  
+  ################
+  ###############
+  
+  #########
+  ###Route Distance (02. miles)
+  ###from hf Stops
+  ########
+  
+  #get high freq stops with hf neigbors
+  m1 <- gWithinDistance(df_stp_rt_hf_xy, df_stp_rt_hf_xy, byid = TRUE, dist = 321.869)
+  m2 <- outer(df_stp_rt_hf_xy$route_id,df_stp_rt_hf_xy$route_id, FUN= "!=")
+  m3 <- m1 == TRUE & m2 == TRUE
+  
+  number_of_routes_within_distance <- function(x){table(x)['TRUE']}
+  l1 <- apply(m3,2,number_of_routes_within_distance)
+  df_stp_rt_hf_xy$cnt_adjacent_hf_routes <- l1
+  
+  within_distance_of_more_than_one_route <- function(x){table(x)['TRUE']>0}
+  l2 <- apply(m3,2,within_distance_of_more_than_one_route)
+  l2[is.na(l2)] <- FALSE
+  
+  df_stp_rt_hf_xy$lgcl_adjacent_hf_routes <- l2
+  
+  hf_routes <- gtfs_objp$mtc_routes_df_sp[gtfs_objp$mtc_routes_df_sp$f_tpa_qual==TRUE,]
+  df_stp_rt_hf_xy$dst_frm_rte <- get_stops_distances_from_routes(df_stp_rt_hf_xy,hf_routes)
+  
+  return(df_stp_rt_hf_xy)
+}
+
+#'Get a buffer around a priority route from a gtfs object
+#'@param df_qualifying_routes tpa qualifying routes subset from gtfs_obj routes table
+#'@param gtfs_obj a gtfsr object
+#'@returns a buffered SpatialPolygons dataframe around that route
+get_buffered_tpa_routes <- function(df_qualifying_routes, gtfs_obj, buffer=402.336) {
+  tpa_route_ids <- names(table(df_qualifying_routes$route_id))
+  row.names(df_qualifying_routes) <- df_qualifying_routes$route_id
+  spply <- get_non_directional_route_geometries(tpa_route_ids, gtfs_obj, buffer=buffer)
+  df_rt_frqncy_sptl <- SpatialPolygonsDataFrame(Sr=spply, data=as.data.frame(df_qualifying_routes),FALSE)
+  row.names(df_rt_frqncy_sptl) <- as.character(seq(1,nrow(df_rt_frqncy_sptl)))
+  return(df_rt_frqncy_sptl)                                   
+}
+
+
+#'Analyze a GTFS object for a provider to determine which bus routes are eligible for Transit Priority Areas (http://www.fehrandpeers.com/sb743/). Return a spatial dataframe with data attached for inspection and review of methodology.
+#'@param A gtfsr object
+#'@returns A gtfsr object with the following tables added to it:
+#       mtc_combined_gtfs - the GTFS tables all joined together into 1 table
+#       mtc_routes_df - the gtfs routes table with statistics on am and pm headways and TPA qualifications (http://www.fehrandpeers.com/sb743/) 
+#       mtc_routes_df_sp - same as above table but with a 10 cm SpatialPolygons object for each route (to represent coverage in all directions)
+get_priority_routes <- function(gtfs_obj) {
+  #######
+  ##Stops
+  #######
+  
+  ###############################################
+  # Section 4. Join all the GTFS provider tables into 1 table based around stops
+  
+  df_sr <- join_all_gtfs_tables(gtfs_obj)
+  df_sr <- make_arrival_hour_less_than_24(df_sr)
+  
+  gtfs_obj$mtc_combined_gtfs <- as.data.frame(df_sr)
+  
+  ###########################################################################################
+  # Section 5. Create Peak Headway tables for weekday trips 
+  
+  am_stops <- flag_and_filter_peak_periods_by_time(df_sr,"AM")
+  am_stops <- remove_duplicate_stops(am_stops) #todo: see https://github.com/MetropolitanTransportationCommission/RegionalTransitDatabase/issues/31
+  am_stops <- count_trips(am_stops) 
+  gtfs_obj$mtc_am_stops <- am_stops
+  
+  pm_stops <- flag_and_filter_peak_periods_by_time(df_sr,"PM")
+  pm_stops <- remove_duplicate_stops(pm_stops) #todo: see https://github.com/MetropolitanTransportationCommission/RegionalTransitDatabase/issues/31
+  pm_stops <- count_trips(pm_stops)
+  gtfs_obj$mtc_pm_stops <- pm_stops 
+  
+  #create an mtc routes table on the gtfs object
+  #we will use this to store tpa qualification flags
+  gtfs_obj$mtc_routes_df <- gtfs_obj$routes_df[,-6][,-6]
+  
+  #########
+  ######get all routes with stats
+  ########
+  am_routes <- get_routes(am_stops)
+  pm_routes <- get_routes(pm_stops)
+  
+  #subset stops to those that meet the headway  
+  am_stops_hdwy <- subset(am_stops,
+                          am_stops$Headways < 16)
+  am_routes_hdwy <- get_routes(am_stops_hdwy)
+  gtfs_obj$mtc_am_routes <- am_routes_hdwy
+  
+  pm_stops_hdwy <- subset(pm_stops,
+                          pm_stops$Headways < 16)
+  pm_routes_hdwy <- get_routes(pm_stops_hdwy)
+  gtfs_obj$mtc_pm_routes <- am_routes_hdwy
+  
+  #update the flags for these on the mtc routes df
+  gtfs_obj$mtc_routes_df$f_am <- gtfs_obj$mtc_routes_df$route_id %in% am_routes$route_id
+  gtfs_obj$mtc_routes_df$f_pm <- gtfs_obj$mtc_routes_df$route_id %in% pm_routes$route_id
+  gtfs_obj$mtc_routes_df$f_am_ls_thn_15m <- gtfs_obj$mtc_routes_df$route_id %in% am_routes_hdwy$route_id
+  gtfs_obj$mtc_routes_df$f_pm_ls_thn_15m <- gtfs_obj$mtc_routes_df$route_id %in% pm_routes_hdwy$route_id
+  
+  ########
+  ##Routes-Qualifying Check
+  ########
+  
+  # Input: am_routes and pm_routes dataframes
+  # Output: qualifying routes and nearly qualifying routes spatial dataframes
+  
+  # divide into 2 dataframes:
+  # 1) routes that are in both am and pm peak periods (qualifying)
+  # 2) routes that are in one or the other but not both, or not in both (nearly qualifying)
+  
+  ###### 1
+
+  gtfs_obj$mtc_routes_df$f_am_bdl <- rep(FALSE,nrow(gtfs_obj$mtc_routes_df))
+  gtfs_obj$mtc_routes_df$f_pm_bdl <- rep(FALSE,nrow(gtfs_obj$mtc_routes_df))
+  gtfs_obj$mtc_routes_df$f_tpa_qual <- rep(FALSE,nrow(gtfs_obj$mtc_routes_df))
+  
+  if (dim(am_routes_hdwy)[1] > 0) {
+    am_routes_qual <- am_routes_hdwy[!duplicated(as.list(am_routes_hdwy)),]
+    am_routes_qual <- am_routes_qual[is_in_both_directions(am_routes_qual[,c("route_id","direction_id")]) 
+                                     | is_loop_route(am_routes_qual$trip_headsign),]
+    gtfs_obj$mtc_routes_df$f_am_bdl <- gtfs_obj$mtc_routes_df$route_id %in% am_routes_qual$route_id
+  }
+  
+  if (dim(pm_stops_hdwy)[1] > 0) {
+    pm_routes_qual <- pm_routes[!duplicated(as.list(pm_stops_hdwy)),]
+    pm_routes_qual <- pm_routes_qual[is_in_both_directions(pm_routes_qual[,c("route_id","direction_id")]) 
+                                     | is_loop_route(pm_routes_qual$trip_headsign),]
+    gtfs_obj$mtc_routes_df$f_pm_bdl <- gtfs_obj$mtc_routes_df$route_id %in% pm_routes_qual$route_id
+  }
+  
+  #this is a terrible way to do things--should just be flagging and uysing route_id
+  if (exists("am_routes_qual") && is.data.frame(get("am_routes_qual")) &&
+      exists("pm_routes_qual") && is.data.frame(get("pm_routes_qual")) &&
+      dim(am_routes_qual)[1] > 0 && dim(pm_routes_qual)[1] > 0) {
+        am_pm_union <- union(am_routes_qual$route_id, pm_routes_qual$route_id)
+        am_pm_intersection <- intersect(am_routes_qual$route_id, pm_routes_qual$route_id)
+        df1 <- rbind(am_routes_qual,pm_routes_qual)
+        df_qualifying_routes <- df1[df1$route_id %in% am_pm_intersection,]
+        gtfs_obj$mtc_routes_df$f_tpa_qual <- gtfs_obj$mtc_routes_df$route_id %in% df_qualifying_routes$route_id
+  }
+  
+  ########
+  ##Routes - End qualifying check
+  ########      
+
+  #also terrible--see above
+  if (exists("am_routes") && is.data.frame(get("am_routes")) &&
+      exists("pm_routes") && is.data.frame(get("pm_routes")) &&
+      dim(am_routes)[1] > 0 && dim(pm_routes)[1] > 0) {
+    
+    df_am_pm_headways <- rbind(am_routes,pm_routes)
+    
+    #todo: get the route stats onto the routes in a way 
+    #that lets you look at inbound and outbound stats
+    #seems like you should also be able to just ask: 
+    #whats the headway between these hours, etc
+    df_am_pm_headways_stats <- get_route_stats(df_am_pm_headways)
+    gtfs_obj$mtc_routes_df_directional_stats <- df_am_pm_headways_stats
+    
+    df_am_pm_headways_stats_non_directional <- get_route_stats_no_direction(df_am_pm_headways)
+    
+    #put the stats in the gtfs_obj
+    gtfs_obj$mtc_routes_df <- left_join(gtfs_obj$mtc_routes_df,df_am_pm_headways_stats_non_directional)
+    
+    #get route polygons
+    spply1 <- get_non_directional_route_geometries(gtfs_obj$mtc_routes_df$route_id,gtfs_obj,buffer=1)
+    
+    #cache the routes ids of routes without geomtries in a slot
+    #these are probably weekend routes
+    no_geom_route_ids <- !gtfs_obj$mtc_routes_df$route_id %in% getSpPPolygonsIDSlots(spply1)
+    gtfs_obj$mtc_routes_without_geometry <- gtfs_obj$mtc_routes_df$route_id[no_geom_route_ids]
+    
+    #subset those without geometries form the data
+    df_tmp1 <- gtfs_obj$mtc_routes_df[gtfs_obj$mtc_routes_df$route_id %in% getSpPPolygonsIDSlots(spply1),]
+  
+    #add a spatial dataframe to the gtfs_obj
+    row.names(df_tmp1) <- df_tmp1$route_id
+    gtfs_obj$mtc_routes_df_sp <- SpatialPolygonsDataFrame(spply1,data=df_tmp1,match.ID = TRUE)
+  }
+  
+  #add on the priority stops dataframe where applicable
+  if(dim(table(gtfs_obj$mtc_routes_df$f_tpa_qual))>1 &&
+     table(gtfs_obj$mtc_routes_df$f_tpa_qual)['TRUE']>0){
+    gtfs_obj$mtc_priority_stops <- get_priority_stops(gtfs_obj)
+    gtfs_obj$mtc_priority_routes <- gtfs_obj$mtc_routes_df[gtfs_obj$mtc_routes_df$f_tpa_qual==TRUE,]
+  }
+  
+  gtfs_obj[which(names(gtfs_obj) %in% c("mtc_am_stops",
+                                        "mtc_pm_stops",
+                                        "mtc_am_routes",
+                                        "mtc_pm_routes",
+                                        "mtc_combined_gtfs"))] <- NULL
+
+  return(gtfs_obj)
+}
+
 #' Make a dataframe GTFS tables all joined together for route frequency calculations
 #' @param a GTFSr object for a given provider with routes, stops, stop_times, etc
 #' @return a mega-GTFSr data frame with stops, stop_times, trips, calendar, and routes all joined
@@ -624,11 +864,29 @@ both_directions_bool_check <- function(direction_ids){
 #geospatial work
 ###############
 
-#' Return a spatial dataframe with the geometries of high frequency routes
-#' @param l1 is a route name
+#' Return a SpatialPolygons with the geometries of a list of high frequency routes
+#' @param route_ids is a list of route id's
+#' @buffer buffer the buffered distance for the route geometry-default set to 1/4 mile
 #' @param gtfs_obj is a gtfsr list of gtfs dataframes
-#' @return routes geometries as polygons, for weekend service
-get_geoms <- function(route_id,gtfs_obj,weekday=TRUE,buffer=402.336) {
+#' @return A SpatialPolygons object of routes geometries as polygons, for weekday service
+get_non_directional_route_geometries <- function(route_ids,buffer,gtfs_obj){
+  l3 <- lapply(route_ids,FUN=get_non_directional_route_geometry,gtfs_obj=gtfs_obj, buffer=buffer)
+  
+  list.condition <- sapply(l3, function(x) class(x)=="SpatialPolygons")
+  l3  <- l3[list.condition]
+  
+  l3_flattened <- SpatialPolygons(lapply(l3, function(x){{x@polygons[[1]]}}))
+  
+  return(l3_flattened)
+}
+
+#' Return a spatial dataframe with the polygon geometries of a single high frequency route in all directions
+#' @param route_id is a route id from gtfs
+#' @param gtfs_obj is a gtfsr list of gtfs dataframes
+#' @param buffer - the buffered distance for the route geometry-default set to 1/4 mile
+#' @param weekday - whether or not to return just the weekday service - default to TRUE
+#' @return routes geometries as polygons, for weekday service for 1 route
+get_non_directional_route_geometry <- function(route_id,gtfs_obj,weekday=TRUE,buffer=402.336) {
   out <- tryCatch({
     #get the spatial dataframe list from gtfsr
     l2 <- get_routes_sldf(gtfs_obj,route_id,NULL,NULL)
@@ -660,11 +918,12 @@ get_geoms <- function(route_id,gtfs_obj,weekday=TRUE,buffer=402.336) {
 }
 
 
+
 #' Return the geometries for a route as single line
 #' @param a list with route_id and direction id
 #' @param a list output by get_hf_geoms 
 #' @return linestring with an id for route and direction
-get_single_route_geom <- function(x,hf_l) {
+get_directional_route_geom <- function(x,hf_l) {
   r_id <- x["route_id"]
   d_id <- x["direction_id"]
   rd_id <- paste(r_id,d_id,sep="-")
@@ -676,21 +935,6 @@ get_single_route_geom <- function(x,hf_l) {
   l1 <- Line(coordinates(g2))
   l2 <- Lines(list(l1),ID=rd_id)
   return(l2)
-}
-
-get_route_geometries <- function(route_ids,buffer){
-  l3 <- lapply(route_ids,FUN=get_geoms,gtfs_obj=gtfs_obj, buffer=buffer)
-  
-  list.condition <- sapply(l3, function(x) class(x)!="SpatialPolygons")
-  l4  <- l3[list.condition]
-  print(l4)
-  
-  list.condition <- sapply(l3, function(x) class(x)=="SpatialPolygons")
-  l3  <- l3[list.condition]
-  
-  l3_flattened <- SpatialPolygons(lapply(l3, function(x){{x@polygons[[1]]}}))
-  
-  return(l3_flattened)
 }
 
 #tried doing this with "outer" but ran into s4 class coersion error
@@ -730,28 +974,38 @@ bind_list_of_routes_spatial_dataframes <- function(l1) {
   return(spdf)
 }
 
+bind_df_list <- function(l1) {
+  df <- l1[[1]]
+  for (s in names(l1[2:length(l1)])) {
+    if(!is.null(dim(l1[[s]])) && dim(l1[[s]])[1]>0) {
+      tmp_df <- l1[[s]]
+      df <- bind_rows(df,tmp_df)
+    }
+  }
+  return(df)
+}
+
+
+
 #'write a spatial dataframe to the current working directory as a geopackage (with date in name-seconds since the epoch)
 #'@param spatial dataframe
 #'@return nothing
-write_to_geopackage_with_date <- function(spdf) {
+write_to_geopackage_with_date <- function(spdf, project_data_path="C:/projects/RTD/RegionalTransitDatabase/data") {
   library(rgdal)
   the_name <- deparse(substitute(spdf))
   writeOGR(spdf,
-           paste0(format(Sys.time(),"%s"),the_name,"_",".gpkg"),
+           paste0(project_data_path,format(Sys.time(),"%s"),the_name,"_",".gpkg"),
            driver="GPKG",
            layer = the_name, 
            overwrite_layer = TRUE)
 }
 
 #'given am routes and pm routes, return a spatial dataframe with the routes and their stats
-#'@param am_routes
-#'@param pm_routes
+#'@param df_routes
 #'@return spatial dataframe (polygons) of routes
-get_routes_with_geoms_and_stats <- function(am_routes,pm_routes) {
-  df1 <- rbind(am_routes,pm_routes)
-  
+get_routes_with_geoms_and_stats <- function(df_routes) {
   route_ids <- names(table(df1$route_id))
-  spply_rts <- get_route_geometries(route_ids, buffer=0.10)
+  spply_rts <- get_non_directional_route_geometries(route_ids, buffer=0.10)
   
   df1_stats <- get_route_stats_no_direction(df1)
   row.names(df1_stats) <- df1_stats$route_id
